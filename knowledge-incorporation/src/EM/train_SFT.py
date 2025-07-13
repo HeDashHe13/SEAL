@@ -1,19 +1,20 @@
-# knowledge-incorporation/src/EM/train_SFT.py
 """
-SFT trainer
+SFT trainer with LoRAMoe integration
 
 Dataset format expected:
 {"prompt": "...", "completion": "..."}
 """
+
 import os
 import argparse
 from datasets import load_dataset
 import torch
 import torch.distributed as dist
+from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from trl import SFTConfig, SFTTrainer
+from trl import SFTConfig
 from peft import get_peft_model
-from loramae import LoRAMoeConfig  # or wherever your LoRAMoe config lives
+from loramae import LoRAMoeConfig, get_loramoe_model  # Make sure to implement get_loramoe_model
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -31,16 +32,62 @@ def parse_args():
     p.add_argument("--logging_steps", type=int, default=10)
     return p.parse_args()
 
+def tokenize_batch(batch, tokenizer, max_length):
+    texts = [ex["prompt"] + ex["completion"] for ex in batch]
+    encodings = tokenizer(
+        texts,
+        truncation=True,
+        max_length=max_length,
+        padding="max_length",
+        return_tensors="pt",
+    )
+    # Labels are input_ids shifted, here just use input_ids and mask padding tokens
+    encodings["labels"] = encodings.input_ids.clone()
+    # Optionally, mask padding tokens loss
+    encodings["labels"][encodings["attention_mask"] == 0] = -100
+    return encodings
+
 class SFTTrainer:
-    def __init__(self, model, args, train_dataset, processing_class, peft_config=None):
-        self.model = model
+    def __init__(self, model, args, train_dataset, tokenizer, peft_config=None):
+        self.args = args
+        self.tokenizer = tokenizer
+        self.train_dataset = train_dataset
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.model = model.to(self.device)
         self.peft_config = peft_config
 
         if peft_config is not None:
             if isinstance(peft_config, LoRAMoeConfig):
-                self.model = get_loramoe_model(self.model, peft_config)
+                self.model = get_loramoe_model(self.model, peft_config).to(self.device)
             else:
-                self.model = get_peft_model(self.model, peft_config)
+                self.model = get_peft_model(self.model, peft_config).to(self.device)
+
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.learning_rate)
+
+    def train(self):
+        self.model.train()
+        dataloader = DataLoader(self.train_dataset, batch_size=self.args.per_device_train_batch_size, shuffle=True)
+        global_step = 0
+        for epoch in range(self.args.num_train_epochs):
+            for batch in dataloader:
+                batch = tokenize_batch(batch, self.tokenizer, max_length=self.args.max_length)
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+
+                outputs = self.model(**batch)
+                loss = outputs.loss
+
+                # Add MoE auxiliary loss if exists
+                if hasattr(self.model, "moe_loss"):
+                    loss = loss + self.peft_config.moe_loss_coef * self.model.moe_loss()
+
+                loss.backward()
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+
+                if global_step % self.args.logging_steps == 0:
+                    print(f"Epoch {epoch} Step {global_step} Loss: {loss.item():.4f}")
+                global_step += 1
 
 def longest_seq_len(dataset, tok):
     return max(
@@ -71,37 +118,38 @@ def main() -> None:
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 
-   loramoe_cfg = LoRAMoeConfig(
-    r=args.lora_rank,
-    lora_alpha=args.lora_alpha,
-    lora_dropout=args.lora_dropout,
-    num_experts=4,          # example MoE specific param
-    moe_loss_coef=0.1,      # example MoE specific param
-    bias="none",
-    task_type="CAUSAL_LM",
-    target_modules=args.lora_target_modules.split(","),
-)
+    loramoe_cfg = LoRAMoeConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        num_experts=4,
+        moe_loss_coef=0.1,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=args.lora_target_modules.split(","),
+    )
 
     trainer = SFTTrainer(
-    model=model,
-    args=sft_args,
-    train_dataset=dataset,
-    processing_class=tokenizer,
-    peft_config=loramoe_cfg,  # <-- changed here
-)
+        model=model,
+        args=sft_args,
+        train_dataset=dataset,
+        tokenizer=tokenizer,
+        peft_config=loramoe_cfg,
+    )
 
     if dist.is_initialized():
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
 
     trainer.train()
+
     peft_model = trainer.model
     merged_model = peft_model.merge_and_unload()
     merged_model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
+
     if dist.is_initialized():
         dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()
