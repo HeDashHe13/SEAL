@@ -12,7 +12,8 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import SFTConfig, SFTTrainer
-from peft import LoraConfig
+from peft import get_peft_model
+from loramae import LoRAMoeConfig  # or wherever your LoRAMoe config lives
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -29,6 +30,17 @@ def parse_args():
     p.add_argument("--lora_target_modules", type=str, default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")
     p.add_argument("--logging_steps", type=int, default=10)
     return p.parse_args()
+
+class SFTTrainer:
+    def __init__(self, model, args, train_dataset, processing_class, peft_config=None):
+        self.model = model
+        self.peft_config = peft_config
+
+        if peft_config is not None:
+            if isinstance(peft_config, LoRAMoeConfig):
+                self.model = get_loramoe_model(self.model, peft_config)
+            else:
+                self.model = get_peft_model(self.model, peft_config)
 
 def longest_seq_len(dataset, tok):
     return max(
@@ -59,22 +71,24 @@ def main() -> None:
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 
-    lora_cfg = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=args.lora_target_modules.split(","),
-    )
+   loramoe_cfg = LoRAMoeConfig(
+    r=args.lora_rank,
+    lora_alpha=args.lora_alpha,
+    lora_dropout=args.lora_dropout,
+    num_experts=4,          # example MoE specific param
+    moe_loss_coef=0.1,      # example MoE specific param
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=args.lora_target_modules.split(","),
+)
 
     trainer = SFTTrainer(
-        model=model,
-        args=sft_args,
-        train_dataset=dataset,
-        processing_class=tokenizer,
-        peft_config=lora_cfg,
-    )
+    model=model,
+    args=sft_args,
+    train_dataset=dataset,
+    processing_class=tokenizer,
+    peft_config=loramoe_cfg,  # <-- changed here
+)
 
     if dist.is_initialized():
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
