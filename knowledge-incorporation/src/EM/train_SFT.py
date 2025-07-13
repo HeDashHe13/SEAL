@@ -41,9 +41,8 @@ def tokenize_batch(batch, tokenizer, max_length):
         padding="max_length",
         return_tensors="pt",
     )
-    # Labels are input_ids shifted, here just use input_ids and mask padding tokens
+    # Labels are input_ids, with padding tokens masked by -100
     encodings["labels"] = encodings.input_ids.clone()
-    # Optionally, mask padding tokens loss
     encodings["labels"][encodings["attention_mask"] == 0] = -100
     return encodings
 
